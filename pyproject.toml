@@ -1,0 +1,57 @@
+[project]
+name = "h2-hres"
+version = "0.1.0"
+description = "Hydrogen-based Hybrid Renewable Energy System optimization using epsilon-constraint MILP"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+    {name = "Research Implementation"}
+]
+keywords = ["hydrogen", "renewable energy", "MILP", "optimization", "HRES"]
+
+dependencies = [
+    "numpy>=1.24.0",
+    "pandas>=2.0.0",
+    "scipy>=1.10.0",
+    "pulp>=2.7.0",
+    "matplotlib>=3.7.0",
+    "seaborn>=0.12.0",
+    "requests>=2.28.0",
+    "pyyaml>=6.0",
+    "tqdm>=4.65.0",
+    "pyarrow>=14.0.0",
+    "highspy>=1.13.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.3.0",
+    "pytest-cov>=4.1.0",
+]
+
+[project.scripts]
+h2hres = "main:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["config", "data", "components", "economics", "optimization", "simulation", "visualization"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = "-v --tb=short"
+
+[tool.coverage.run]
+source = ["config", "data", "components", "economics", "optimization", "simulation", "visualization"]
+omit = ["tests/*"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
+]

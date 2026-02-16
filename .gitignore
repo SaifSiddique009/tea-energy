@@ -1,0 +1,36 @@
+# Python runtime
+__pycache__/
+*.py[cod]
+*.so
+
+# Virtual environment
+.venv/
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+
+# IDE
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Generated data (regenerable via NASA POWER API)
+data/cache/
+
+# Generated output (regenerable via --figures)
+results/figures/
+
+# Test coverage
+.coverage
+htmlcov/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Reference paper (too large for git)
+*.pdf
