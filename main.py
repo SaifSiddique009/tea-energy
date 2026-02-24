@@ -175,12 +175,17 @@ def run_optimization(
     print(f"Solver config: time_limit={time_limit}s, gap={gap*100:.1f}%, verbose={solver_verbose}")
     print()
 
+    # Load seasonal LHV profile for biomass fuel cost
+    from data.fetchers.biomass_data import BiomassDataProvider
+    lhv_profile = BiomassDataProvider().get_hourly_lhv(2023)
+
     # Create optimizer
     optimizer = EpsilonConstraintOptimizer(
         demand_profile=demand,
         irradiance_factor=irradiance_factor,
         wind_factor=wind_factor,
         h2_price=6.6,
+        lhv_profile=lhv_profile,
         time_limit_sec=time_limit,
         gap_tolerance=gap,
         solver_verbose=solver_verbose,

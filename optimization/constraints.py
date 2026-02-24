@@ -32,25 +32,22 @@ class CapacityBounds:
     """Bounds for component capacities."""
 
     pv_min: float = 0.0
-    pv_max: float = 100.0
+    pv_max: float = 60.0       # Urban rooftop constraint (~70 households)
     wind_min: float = 0.0
-    wind_max: float = 100.0
+    wind_max: float = 45.0     # Urban area constraint for turbines
     electrolyzer_min: float = 0.0
-    electrolyzer_max: float = 100.0
+    electrolyzer_max: float = 60.0
     fuel_cell_min: float = 0.0
-    fuel_cell_max: float = 50.0
-    # FIXED: Minimum H2 storage required for system operation
-    # Paper Table 5: H2 tank is part of optimal system
-    h2_storage_min: float = 20.0  # Minimum 20 kg storage
-    h2_storage_max: float = 500.0
+    fuel_cell_max: float = 30.0
+    h2_storage_min: float = 20.0  # Minimum for system operation
+    h2_storage_max: float = 200.0
     biomass_min: float = 0.0
-    biomass_max: float = 100.0
-    # FIXED: Maximum H2 sales rate (kg/hour) - market constraint
-    # Realistic: ~2 kg/hour max absorption by local market
-    h2_max_sales_rate: float = 2.0
-    # FIXED: Maximum annual H2 sales (kg/year) - market constraint
-    # Based on paper results: ~500-2000 kg/year is realistic for this community
-    h2_max_annual_sales: float = 3000.0
+    biomass_max: float = 45.0  # Urban area feedstock constraint
+    # Maximum H2 sales rate (kg/hour) - local market absorption limit
+    h2_max_sales_rate: float = 0.5
+    # Maximum annual H2 sales (kg/year) - local market demand for this community
+    # Paper's optimal system (~40 kW PV, ~30 kW Wind) naturally produces ~500 kg/yr surplus
+    h2_max_annual_sales: float = 500.0
 
 
 class ConstraintBuilder:

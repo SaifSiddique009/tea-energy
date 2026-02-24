@@ -106,6 +106,7 @@ class EpsilonConstraintOptimizer:
         economic: Optional[EconomicParameters] = None,
         bounds: Optional[CapacityBounds] = None,
         h2_price: Optional[float] = None,
+        lhv_profile: Optional[np.ndarray] = None,
         solver: str = "HiGHS",
         time_limit_sec: int = 300,
         gap_tolerance: float = 0.02,
@@ -121,6 +122,7 @@ class EpsilonConstraintOptimizer:
             economic: Economic parameters
             bounds: Capacity bounds
             h2_price: H2 price for revenue
+            lhv_profile: Hourly biomass LHV values (MJ/kg), 8760 array
             solver: MILP solver ("HiGHS", "CBC", or "GLPK")
             time_limit_sec: Max seconds per solve (default 300)
             gap_tolerance: Relative optimality gap (default 0.02 = 2%)
@@ -135,6 +137,20 @@ class EpsilonConstraintOptimizer:
         self.economic = economic or EconomicParameters()
         self.bounds = bounds or CapacityBounds()
         self.h2_price = h2_price or self.economic.h2_price_base
+
+        # Compute hourly BM fuel cost ($/kWh) from seasonal LHV profile
+        if lhv_profile is not None:
+            self.lhv_profile = lhv_profile
+        else:
+            self.lhv_profile = self._default_lhv_profile()
+
+        from config.parameters import BiomassParameters
+        bm_params = BiomassParameters()
+        fuel_per_kg = self.costs.biomass_fuel_cost / 1000.0  # $/ton → $/kg
+        self.bm_fuel_cost_kwh = np.array([
+            (3.6 / (bm_params.thermal_efficiency * lhv * (1.0 - bm_params.total_heat_loss))) * fuel_per_kg
+            for lhv in self.lhv_profile
+        ])
 
         self.cost_calculator = CostCalculator(self.costs, self.economic)
         self.objective_calculator = ObjectiveCalculator(self.costs, self.economic)
@@ -169,6 +185,30 @@ class EpsilonConstraintOptimizer:
                 gapRel=gap_tolerance,
             )
 
+    @staticmethod
+    def _default_lhv_profile() -> np.ndarray:
+        """Generate default hourly LHV profile from Nairobi monthly precipitation.
+
+        Returns:
+            8760-element array of LHV values (MJ/kg)
+        """
+        from config.parameters import BiomassParameters
+        bm = BiomassParameters()
+        # Monthly precipitation (mm) for Nairobi (Table 3-4)
+        precip = {1: 60, 2: 50, 3: 100, 4: 200, 5: 150, 6: 30,
+                  7: 15, 8: 20, 9: 25, 10: 50, 11: 120, 12: 80}
+        lhv = {}
+        for m, p in precip.items():
+            if p <= 12:
+                lhv[m] = bm.lhv_dry
+            elif p >= 120:
+                lhv[m] = bm.lhv_wet
+            else:
+                lhv[m] = bm.lhv_dry - ((p - 12) / (120 - 12)) * (bm.lhv_dry - bm.lhv_wet)
+        import pandas as pd
+        dates = pd.date_range(start="2023-01-01", periods=8760, freq="h")
+        return np.array([lhv[m] for m in dates.month])
+
     def _build_model(
         self,
         name: str = "HRES_Optimization",
@@ -202,9 +242,14 @@ class EpsilonConstraintOptimizer:
         g_h = [pulp.LpVariable(f"g_h_{h}", lowBound=0) for h in range(self.hours)]
         h2_level = [pulp.LpVariable(f"h2_{h}", lowBound=0) for h in range(self.hours)]
 
-        # Binary variables for on/off status
-        y_fc = [pulp.LpVariable(f"y_fc_{h}", cat="Binary") for h in range(self.hours)]
-        y_bm = [pulp.LpVariable(f"y_bm_{h}", cat="Binary") for h in range(self.hours)]
+        # Binary variables for BM on/off status, using 4-hour blocks to reduce
+        # binary count from 8760 to 2190. Physically realistic: steam Rankine BM
+        # generators operate in multi-hour blocks due to startup time.
+        BM_BLOCK_SIZE = 4
+        n_blocks = (self.hours + BM_BLOCK_SIZE - 1) // BM_BLOCK_SIZE
+        y_bm_block = [pulp.LpVariable(f"y_bm_b{b}", cat="Binary") for b in range(n_blocks)]
+        # Map each hour to its block's binary
+        y_bm = [y_bm_block[h // BM_BLOCK_SIZE] for h in range(self.hours)]
 
         # Add constraints
 
@@ -221,25 +266,30 @@ class EpsilonConstraintOptimizer:
             ), f"balance_{h}"
 
         # FC and BM capacity limits
-        M_fc = self.bounds.fuel_cell_max
         M_bm = self.bounds.biomass_max
 
         for h in range(self.hours):
             model += p_fc[h] <= cap_fc, f"fc_cap_{h}"
-            model += p_fc[h] <= M_fc * y_fc[h], f"fc_on_{h}"
             model += p_bm[h] <= cap_bm, f"bm_cap_{h}"
             model += p_bm[h] <= M_bm * y_bm[h], f"bm_on_{h}"
+            # BM minimum load constraint (Paper Fig 4, BiomassParameters.min_load_fraction=0.30)
+            # When y_bm=1 (on): p_bm >= 0.30 * cap_bm
+            # When y_bm=0 (off): RHS becomes negative, constraint relaxed
+            model += p_bm[h] >= 0.30 * cap_bm - M_bm * (1 - y_bm[h]), f"bm_min_load_{h}"
 
         # Electrolyzer constraints
         for h in range(self.hours):
             model += p_elz[h] <= cap_elz, f"elz_cap_{h}"
 
-        # H2 production/consumption (simplified linear model)
-        h2_rate = 0.02  # kg H2 per kWh (approximation)
+        # H2 production/consumption rates
+        # ELZ: ~70% efficient → 1/(0.70 * 33.33 kWh/kg) ≈ 0.021 kg/kWh
+        ELZ_H2_RATE = 0.02100
+        # FC: ~50% efficient (V_cell/1.48 ≈ 0.499) → 1/(0.499 * 33.33) ≈ 0.060 kg/kWh
+        FC_H2_RATE = 1.0 / (0.499 * 33.33)  # ~0.0601 kg/kWh
 
         for h in range(self.hours):
-            model += q_elz[h] == p_elz[h] * h2_rate, f"h2_prod_{h}"
-            model += q_fc[h] == p_fc[h] * h2_rate * 1.2, f"h2_cons_{h}"
+            model += q_elz[h] == p_elz[h] * ELZ_H2_RATE, f"h2_prod_{h}"
+            model += q_fc[h] == p_fc[h] * FC_H2_RATE, f"h2_cons_{h}"
 
         # H2 storage balance
         initial_h2 = 0.5  # Initial SOC fraction
@@ -275,11 +325,10 @@ class EpsilonConstraintOptimizer:
         # Local market has finite demand for H2
         model += pulp.lpSum(g_h) <= self.bounds.h2_max_annual_sales, "annual_h2_sales_limit"
 
-        # CRITICAL FIX: Biomass annual utilization limit
-        # Biomass can't run at 100% due to feedstock availability, maintenance
-        # Max ~50% capacity factor is realistic
-        max_bm_hours = int(0.5 * self.hours)  # 50% capacity factor limit
-        model += pulp.lpSum(y_bm) <= max_bm_hours, "biomass_utilization_limit"
+        # Biomass annual utilization limit (~50% capacity factor)
+        # Count unique blocks (not repeated hourly references)
+        max_bm_blocks = int(0.5 * n_blocks)
+        model += pulp.lpSum(y_bm_block) <= max_bm_blocks, "biomass_utilization_limit"
 
         variables = {
             "cap_pv": cap_pv,
@@ -298,8 +347,8 @@ class EpsilonConstraintOptimizer:
             "q_fc": q_fc,
             "g_h": g_h,
             "h2_level": h2_level,
-            "y_fc": y_fc,
             "y_bm": y_bm,
+            "y_bm_block": y_bm_block,
         }
 
         return model, variables
@@ -314,25 +363,53 @@ class EpsilonConstraintOptimizer:
             Tuple of (coe_expression, ume_expression)
         """
         crf = self.economic.capital_recovery_factor()
+        dr = self.economic.discount_rate
+        n = self.economic.project_lifetime
 
-        # Capital cost expression
+        # Effective capital costs including replacement costs (Paper Eq 4)
+        # Components with lifetime < project_lifetime need periodic replacements
+        # effective_cost = initial + Σ (initial / (1+dr)^t) for each replacement year
+        from config.parameters import ComponentLifetimes
+        lifetimes = ComponentLifetimes()
+
+        def _effective_capital(initial: float, lifetime: int) -> float:
+            total = initial
+            t = lifetime
+            while t < n:
+                total += initial / (1 + dr) ** t
+                t += lifetime
+            return total
+
+        eff_pv = _effective_capital(self.costs.pv_capital, lifetimes.pv)         # 900 (no replacement)
+        eff_wind = _effective_capital(self.costs.wind_capital, lifetimes.wind)    # ~1324
+        eff_elz = _effective_capital(self.costs.electrolyzer_capital, lifetimes.electrolyzer)  # ~1053
+        eff_fc = _effective_capital(self.costs.fuel_cell_capital, lifetimes.fuel_cell)  # ~2176 (4 replacements!)
+        eff_h2 = _effective_capital(self.costs.h2_tank_capital, lifetimes.h2_tank)     # 1100 (no replacement)
+        eff_bm = _effective_capital(self.costs.biomass_capital, lifetimes.biomass)      # ~662
+
+        # Capital cost expression with replacement costs
         capital = (
-            self.costs.pv_capital * variables["cap_pv"]
-            + self.costs.wind_capital * variables["cap_wind"]
-            + self.costs.electrolyzer_capital * variables["cap_elz"]
-            + self.costs.fuel_cell_capital * variables["cap_fc"]
-            + self.costs.h2_tank_capital * variables["cap_h2"]
-            + self.costs.biomass_capital * variables["cap_bm"]
+            eff_pv * variables["cap_pv"]
+            + eff_wind * variables["cap_wind"]
+            + eff_elz * variables["cap_elz"]
+            + eff_fc * variables["cap_fc"]
+            + eff_h2 * variables["cap_h2"]
+            + eff_bm * variables["cap_bm"]
         )
 
-        # Annual O&M (simplified)
-        om = (
+        # Annual O&M (fixed + variable BM fuel cost)
+        om_fixed = (
             self.costs.pv_om_annual * variables["cap_pv"]
             + self.costs.wind_om_annual * variables["cap_wind"]
             + self.costs.electrolyzer_om_annual * variables["cap_elz"]
             + self.costs.biomass_om_annual * variables["cap_bm"]
-            + self.costs.fuel_cell_om_hourly * pulp.lpSum(variables["y_fc"])
         )
+        # BM variable fuel cost: penalizes each kWh of BM output by seasonal fuel cost
+        bm_fuel_cost = pulp.lpSum(
+            variables["p_bm"][h] * self.bm_fuel_cost_kwh[h]
+            for h in range(self.hours)
+        )
+        om = om_fixed + bm_fuel_cost
 
         # Annualized cost
         annual_cost = capital * crf + om
@@ -559,22 +636,47 @@ class EpsilonConstraintOptimizer:
         annual_unmet = sum(pulp.value(variables["p_ume"][h]) for h in range(self.hours))
         annual_h2_sold = sum(pulp.value(variables["g_h"][h]) for h in range(self.hours))
 
-        # Calculate costs
+        # Calculate costs (with replacement costs matching objective)
         crf = self.economic.capital_recovery_factor()
+        dr = self.economic.discount_rate
+        n = self.economic.project_lifetime
+        from config.parameters import ComponentLifetimes
+        lifetimes = ComponentLifetimes()
+
+        def _eff_cap(initial, lifetime):
+            total = initial
+            t = lifetime
+            while t < n:
+                total += initial / (1 + dr) ** t
+                t += lifetime
+            return total
+
         capital = (
-            self.costs.pv_capital * cap_pv
-            + self.costs.wind_capital * cap_wind
-            + self.costs.electrolyzer_capital * cap_elz
-            + self.costs.fuel_cell_capital * cap_fc
-            + self.costs.h2_tank_capital * cap_h2
-            + self.costs.biomass_capital * cap_bm
+            _eff_cap(self.costs.pv_capital, lifetimes.pv) * cap_pv
+            + _eff_cap(self.costs.wind_capital, lifetimes.wind) * cap_wind
+            + _eff_cap(self.costs.electrolyzer_capital, lifetimes.electrolyzer) * cap_elz
+            + _eff_cap(self.costs.fuel_cell_capital, lifetimes.fuel_cell) * cap_fc
+            + _eff_cap(self.costs.h2_tank_capital, lifetimes.h2_tank) * cap_h2
+            + _eff_cap(self.costs.biomass_capital, lifetimes.biomass) * cap_bm
         )
 
+        # BM fuel cost (matches objective function)
+        bm_fuel_total = sum(
+            pulp.value(variables["p_bm"][h]) * self.bm_fuel_cost_kwh[h]
+            for h in range(self.hours)
+        )
+        # FC hourly O&M: count hours where FC produced power
+        fc_om_total = self.costs.fuel_cell_om_hourly * sum(
+            1.0 for h in range(self.hours)
+            if pulp.value(variables["p_fc"][h]) > 0.01
+        )
         om = (
             self.costs.pv_om_annual * cap_pv
             + self.costs.wind_om_annual * cap_wind
             + self.costs.electrolyzer_om_annual * cap_elz
             + self.costs.biomass_om_annual * cap_bm
+            + fc_om_total
+            + bm_fuel_total
         )
 
         total_cost = capital * crf + om
