@@ -67,6 +67,10 @@ class EconomicParameters:
     # Inflation rate (assumed)
     inflation_rate: float = 0.03
 
+    # Installation cost factor — multiplies all capital costs.
+    # Paper's Table 2 costs are already total installed costs, so factor = 1.0.
+    installation_factor: float = 1.0
+
     def capital_recovery_factor(self) -> float:
         """Calculate the Capital Recovery Factor (CRF).
 

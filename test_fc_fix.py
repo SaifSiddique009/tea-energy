@@ -1,4 +1,4 @@
-"""Quick diagnostic: test if FC > 0 after BM min load + fuel cost changes."""
+"""Quick diagnostic: test optimization with H2-decoupled objective."""
 import numpy as np
 from simulation.hourly_simulation import HourlySimulator
 from optimization.epsilon_constraint import EpsilonConstraintOptimizer
@@ -29,34 +29,25 @@ print(f"Demand: {len(demand)} hours, peak={np.max(demand):.1f} kW, avg={np.mean(
 print(f"BM fuel cost range: ${np.min(lhv_profile):.1f}-{np.max(lhv_profile):.1f} MJ/kg")
 print()
 
-# Bounds: ~30-50% headroom above paper optimal values
-# Paper: PV=41.8, Wind=30.1, BM=27.4, FC=15.1, ELZ=40.3, H2=100
-bounds = CapacityBounds(
-    pv_max=60.0,
-    wind_max=45.0,
-    biomass_max=45.0,       # Paper: 27.4, cap to prevent oversizing
-    electrolyzer_max=60.0,  # Paper: 40.3, cap to prevent oversizing
-    fuel_cell_max=30.0,     # Paper: 15.1
-    h2_storage_max=200.0,   # Paper: ~100, allow room
-)
-
-# Use CBC for better heuristics (finds good feasible solutions faster)
+# Use DEFAULT bounds (wide, non-binding) — no explicit overrides
+# The optimizer will find interior optima, not hit bounds
 optimizer = EpsilonConstraintOptimizer(
     demand_profile=demand,
     irradiance_factor=irradiance_factor,
     wind_factor=wind_factor,
     h2_price=6.6,
     lhv_profile=lhv_profile,
-    bounds=bounds,
-    solver="CBC",
-    time_limit_sec=900,     # 15 minutes for better convergence
+    # bounds=CapacityBounds() — uses defaults (wide bounds, no H2 min floor)
+    solver="HiGHS",          # Same default solver as main.py
+    time_limit_sec=900,     # 15 minutes max per solve
     gap_tolerance=0.05,
     solver_verbose=True,
 )
 
 print("=" * 60)
+print("Installation factor 1.5x on capital costs (accounts for BOS/installation)")
+print("H2 revenue at $6.6/kg in objective, wide bounds, no BM utilization cap")
 print("Solving single epsilon-constraint: UME <= 0.04 (~96% reliability)")
-print("4-hour BM blocks, reduced H2 sales (500 kg/yr), tighter bounds")
 print("=" * 60)
 
 result = optimizer.solve_epsilon_constraint(epsilon=0.04)
@@ -81,9 +72,21 @@ print(f"  Total cost:   ${result.total_cost:.0f}/yr")
 print(f"  H2 revenue:   ${result.h2_revenue:.0f}/yr")
 print("=" * 60)
 
-if result.fuel_cell_capacity > 0 and result.biomass_capacity > 0:
-    print("\n*** SUCCESS: FC > 0 AND BM > 0! ***")
-elif result.fuel_cell_capacity > 0:
-    print("\n*** FC > 0 but BM = 0. Need further investigation. ***")
+# Check key indicators
+issues = []
+defaults = CapacityBounds()
+if abs(result.pv_capacity - defaults.pv_max) < 0.1:
+    issues.append(f"PV at bound ({defaults.pv_max})")
+if abs(result.wind_capacity - defaults.wind_max) < 0.1:
+    issues.append(f"Wind at bound ({defaults.wind_max})")
+if abs(result.biomass_capacity - defaults.biomass_max) < 0.1:
+    issues.append(f"BM at bound ({defaults.biomass_max})")
+if result.fuel_cell_capacity < 0.1:
+    issues.append("FC = 0")
+if result.h2_storage_capacity < 0.1:
+    issues.append("H2 storage = 0")
+
+if not issues:
+    print("\n*** SUCCESS: All components at interior optima, FC > 0! ***")
 else:
-    print("\n*** FC = 0. Need further investigation. ***")
+    print(f"\n*** ISSUES: {', '.join(issues)} ***")

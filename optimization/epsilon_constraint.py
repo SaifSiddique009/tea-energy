@@ -280,6 +280,9 @@ class EpsilonConstraintOptimizer:
         # Electrolyzer constraints
         for h in range(self.hours):
             model += p_elz[h] <= cap_elz, f"elz_cap_{h}"
+            # ELZ renewable-only: electrolyzer can only consume renewable electricity
+            # Prevents BM → ELZ → H2 sales exploit (paper Figure 2: ELZ fed by RE excess)
+            model += p_elz[h] <= p_pv[h] + p_wind[h], f"elz_re_only_{h}"
 
         # H2 production/consumption rates
         # ELZ: ~70% efficient → 1/(0.70 * 33.33 kWh/kg) ≈ 0.021 kg/kWh
@@ -325,9 +328,9 @@ class EpsilonConstraintOptimizer:
         # Local market has finite demand for H2
         model += pulp.lpSum(g_h) <= self.bounds.h2_max_annual_sales, "annual_h2_sales_limit"
 
-        # Biomass annual utilization limit (~50% capacity factor)
-        # Count unique blocks (not repeated hourly references)
-        max_bm_blocks = int(0.5 * n_blocks)
+        # BM utilization cap: steam Rankine availability + maintenance (~50%)
+        # Proxy for paper's dispatch priority (FC tried before BM, Eq 9-10)
+        max_bm_blocks = int(0.50 * n_blocks)
         model += pulp.lpSum(y_bm_block) <= max_bm_blocks, "biomass_utilization_limit"
 
         variables = {
@@ -380,12 +383,15 @@ class EpsilonConstraintOptimizer:
                 t += lifetime
             return total
 
-        eff_pv = _effective_capital(self.costs.pv_capital, lifetimes.pv)         # 900 (no replacement)
-        eff_wind = _effective_capital(self.costs.wind_capital, lifetimes.wind)    # ~1324
-        eff_elz = _effective_capital(self.costs.electrolyzer_capital, lifetimes.electrolyzer)  # ~1053
-        eff_fc = _effective_capital(self.costs.fuel_cell_capital, lifetimes.fuel_cell)  # ~2176 (4 replacements!)
-        eff_h2 = _effective_capital(self.costs.h2_tank_capital, lifetimes.h2_tank)     # 1100 (no replacement)
-        eff_bm = _effective_capital(self.costs.biomass_capital, lifetimes.biomass)      # ~662
+        # Installation factor accounts for BOS, installation, site costs
+        inst = self.economic.installation_factor
+
+        eff_pv = _effective_capital(self.costs.pv_capital * inst, lifetimes.pv)
+        eff_wind = _effective_capital(self.costs.wind_capital * inst, lifetimes.wind)
+        eff_elz = _effective_capital(self.costs.electrolyzer_capital * inst, lifetimes.electrolyzer)
+        eff_fc = _effective_capital(self.costs.fuel_cell_capital * inst, lifetimes.fuel_cell)
+        eff_h2 = _effective_capital(self.costs.h2_tank_capital * inst, lifetimes.h2_tank)
+        eff_bm = _effective_capital(self.costs.biomass_capital * inst, lifetimes.biomass)
 
         # Capital cost expression with replacement costs
         capital = (
@@ -414,7 +420,7 @@ class EpsilonConstraintOptimizer:
         # Annualized cost
         annual_cost = capital * crf + om
 
-        # H2 revenue
+        # H2 revenue at market price
         h2_revenue = self.h2_price * pulp.lpSum(variables["g_h"])
 
         # Net annual cost
@@ -651,13 +657,16 @@ class EpsilonConstraintOptimizer:
                 t += lifetime
             return total
 
+        # Apply same installation factor as MILP objective
+        inst = self.economic.installation_factor
+
         capital = (
-            _eff_cap(self.costs.pv_capital, lifetimes.pv) * cap_pv
-            + _eff_cap(self.costs.wind_capital, lifetimes.wind) * cap_wind
-            + _eff_cap(self.costs.electrolyzer_capital, lifetimes.electrolyzer) * cap_elz
-            + _eff_cap(self.costs.fuel_cell_capital, lifetimes.fuel_cell) * cap_fc
-            + _eff_cap(self.costs.h2_tank_capital, lifetimes.h2_tank) * cap_h2
-            + _eff_cap(self.costs.biomass_capital, lifetimes.biomass) * cap_bm
+            _eff_cap(self.costs.pv_capital * inst, lifetimes.pv) * cap_pv
+            + _eff_cap(self.costs.wind_capital * inst, lifetimes.wind) * cap_wind
+            + _eff_cap(self.costs.electrolyzer_capital * inst, lifetimes.electrolyzer) * cap_elz
+            + _eff_cap(self.costs.fuel_cell_capital * inst, lifetimes.fuel_cell) * cap_fc
+            + _eff_cap(self.costs.h2_tank_capital * inst, lifetimes.h2_tank) * cap_h2
+            + _eff_cap(self.costs.biomass_capital * inst, lifetimes.biomass) * cap_bm
         )
 
         # BM fuel cost (matches objective function)

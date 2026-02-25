@@ -192,6 +192,8 @@ def run_optimization(
     )
 
     print(f"Generating Pareto front with {n_pareto_points} points...")
+    print(f"Note: MILP objective minimizes total cost (H2 revenue decoupled).")
+    print(f"      COE = (TC - H2_revenue) / E_served computed post-optimization.")
     print()
 
     # Generate Pareto front

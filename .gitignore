@@ -32,5 +32,4 @@ htmlcov/
 # Jupyter
 .ipynb_checkpoints/
 
-# Reference paper (too large for git)
-*.pdf
+
