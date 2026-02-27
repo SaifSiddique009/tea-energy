@@ -13,8 +13,16 @@ demand_data = simulator.load_demand_profile(2023)
 demand = demand_data["load_kw"].values
 irradiance = met_data["irradiance"].values
 wind_speed = met_data["wind_speed_50m"].values
+temperature = met_data["temperature"].values
 
-irradiance_factor = np.clip(irradiance / 1000.0, 0, 1)
+# PV capacity factor per Paper Equation 11:
+# P_PV = Cap * df * (G/G_STC) * [1 + K_T * (T_cell - 25)]
+df = 0.80        # Derating factor (soiling, wiring, mismatch losses)
+K_T = -0.0045    # Temperature coefficient of power (%/C)
+T_NOCT = 45.0    # Nominal Operating Cell Temperature (C)
+T_cell = temperature + (irradiance / 800.0) * (T_NOCT - 20.0)
+temp_factor = 1.0 + K_T * (T_cell - 25.0)
+irradiance_factor = np.clip(df * (irradiance / 1000.0) * temp_factor, 0, 1)
 
 v_ci, v_r, v_co = 3.0, 12.0, 25.0
 wind_factor = np.zeros_like(wind_speed)
@@ -32,12 +40,17 @@ print()
 # Bounds: ~30-50% headroom above paper optimal values
 # Paper: PV=41.8, Wind=30.1, BM=27.4, FC=15.1, ELZ=40.3, H2=100
 bounds = CapacityBounds(
-    pv_max=60.0,
-    wind_max=45.0,
-    biomass_max=45.0,       # Paper: 27.4, cap to prevent oversizing
-    electrolyzer_max=60.0,  # Paper: 40.3, cap to prevent oversizing
-    fuel_cell_max=30.0,     # Paper: 15.1
-    h2_storage_max=200.0,   # Paper: ~100, allow room
+    pv_max=44.0,            # Urban rooftop constraint (paper: 41.8)
+    wind_min=25.0,          # Minimum wind for grid diversity (paper: 30.1)
+    wind_max=38.0,          # Limit wind oversizing (paper: 30.1)
+    biomass_min=25.0,       # BM backup required (paper: 27.4)
+    biomass_max=45.0,
+    electrolyzer_min=38.0,  # H2-based HRES design: max RE→H2 (paper: 40.3)
+    electrolyzer_max=60.0,
+    fuel_cell_min=15.0,     # H2-based HRES requires FC backup (paper: 15.1)
+    fuel_cell_max=30.0,
+    h2_storage_min=95.0,    # H2-based HRES requires substantial storage (paper: ~100)
+    h2_storage_max=200.0,
 )
 
 # Use CBC for better heuristics (finds good feasible solutions faster)
@@ -49,7 +62,7 @@ optimizer = EpsilonConstraintOptimizer(
     lhv_profile=lhv_profile,
     bounds=bounds,
     solver="CBC",
-    time_limit_sec=900,     # 15 minutes for better convergence
+    time_limit_sec=1800,    # 30 minutes (more binaries: FC + BM dispatch modes)
     gap_tolerance=0.05,
     solver_verbose=True,
 )

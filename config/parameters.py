@@ -44,7 +44,7 @@ class ComponentCosts:
     biomass_om_annual: float = 15.0  # $/year per kW
     
     # Fuel costs
-    biomass_fuel_cost: float = 40.0  # $/ton
+    biomass_fuel_cost: float = 40.0  # $/ton (feedstock collection/processing)
 
 
 @dataclass
@@ -63,6 +63,10 @@ class EconomicParameters:
     # Hydrogen market prices ($/kg)
     h2_price_base: float = 6.6  # Base case
     h2_price_high: float = 9.9  # Sensitivity analysis
+
+    # Installation/BOS factor (Paper Eq 4: includes balance of system,
+    # wiring, mounting, installation labor, engineering, contingency)
+    installation_factor: float = 1.5
 
     # Inflation rate (assumed)
     inflation_rate: float = 0.03

@@ -156,9 +156,16 @@ def run_optimization(
     # Calculate normalized capacity factors
     irradiance = met_data["irradiance"].values
     wind_speed = met_data["wind_speed_50m"].values
+    temperature = met_data["temperature"].values
 
-    # Normalize to 0-1 range
-    irradiance_factor = irradiance / 1000.0  # Normalize by STC
+    # PV capacity factor per Paper Equation 11:
+    # P_PV = Cap * df * (G/G_STC) * [1 + K_T * (T_cell - 25)]
+    df = 0.80        # Derating factor (soiling, wiring, mismatch losses)
+    K_T = -0.0045    # Temperature coefficient of power (%/C)
+    T_NOCT = 45.0    # Nominal Operating Cell Temperature (C)
+    T_cell = temperature + (irradiance / 800.0) * (T_NOCT - 20.0)
+    temp_factor = 1.0 + K_T * (T_cell - 25.0)
+    irradiance_factor = df * (irradiance / 1000.0) * temp_factor
     irradiance_factor = np.clip(irradiance_factor, 0, 1)
 
     # Wind factor using simplified power curve
@@ -179,13 +186,14 @@ def run_optimization(
     from data.fetchers.biomass_data import BiomassDataProvider
     lhv_profile = BiomassDataProvider().get_hourly_lhv(2023)
 
-    # Create optimizer
+    # Create optimizer (CBC preferred for better heuristics with this problem)
     optimizer = EpsilonConstraintOptimizer(
         demand_profile=demand,
         irradiance_factor=irradiance_factor,
         wind_factor=wind_factor,
         h2_price=6.6,
         lhv_profile=lhv_profile,
+        solver="CBC",
         time_limit_sec=time_limit,
         gap_tolerance=gap,
         solver_verbose=solver_verbose,
@@ -198,13 +206,13 @@ def run_optimization(
     pareto_result = optimizer.generate_pareto_front(n_points=n_pareto_points)
 
     print("Pareto Front Results:")
-    print("-" * 60)
-    print(f"{'Point':>5} {'COE ($/kWh)':>12} {'Reliability':>12} {'PV (kW)':>10} {'Wind (kW)':>10}")
-    print("-" * 60)
+    print("-" * 110)
+    print(f"{'#':>3} {'COE':>10} {'Rel':>8} {'PV':>6} {'Wind':>6} {'BM':>6} {'FC':>6} {'ELZ':>6} {'H2':>6} {'H2sold':>8}")
+    print("-" * 110)
 
     for i, sol in enumerate(pareto_result.solutions):
         knee_marker = " *" if i == pareto_result.knee_point_idx else ""
-        print(f"{i+1:>5} {sol.coe:>12.3f} {sol.reliability:>12.3f} {sol.pv_capacity:>10.1f} {sol.wind_capacity:>10.1f}{knee_marker}")
+        print(f"{i+1:>3} ${sol.coe:>8.3f} {sol.reliability:>8.3f} {sol.pv_capacity:>6.1f} {sol.wind_capacity:>6.1f} {sol.biomass_capacity:>6.1f} {sol.fuel_cell_capacity:>6.1f} {sol.electrolyzer_capacity:>6.1f} {sol.h2_storage_capacity:>6.1f} {sol.annual_h2_sold_kg:>8.0f}{knee_marker}")
 
     print()
     print("* = Knee point (optimal trade-off)")
@@ -467,14 +475,14 @@ Examples:
     parser.add_argument(
         "--time-limit",
         type=int,
-        default=300,
-        help="Max seconds per MILP solve (default: 300)",
+        default=1800,
+        help="Max seconds per MILP solve (default: 1800)",
     )
     parser.add_argument(
         "--gap",
         type=float,
-        default=0.02,
-        help="Relative optimality gap tolerance (default: 0.02 = 2%%)",
+        default=0.05,
+        help="Relative optimality gap tolerance (default: 0.05 = 5%%)",
     )
     parser.add_argument(
         "--solver-verbose",
