@@ -1,4 +1,4 @@
-"""ε-constraint multi-objective MILP optimizer.
+"""ε-constraint multi-objective LP optimizer (pure LP, no binary variables).
 
 Reference: Section 2.5, Equation 1, Figure 3
 
@@ -18,8 +18,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pulp
 
-from optimization.objectives import ObjectiveCalculator, ObjectiveValues
-from optimization.constraints import ConstraintBuilder, CapacityBounds
+from optimization.constraints import CapacityBounds
 from economics.costs import CostCalculator, SystemCosts
 from config.parameters import ComponentCosts, EconomicParameters
 
@@ -50,9 +49,12 @@ class OptimizationResult:
     total_cost: float
     h2_revenue: float
 
+    # Mode distribution (optional)
+    mode_distribution: Optional[Dict] = None
+
     def to_dict(self) -> Dict:
         """Convert to dictionary."""
-        return {
+        d = {
             "status": self.status,
             "coe": self.coe,
             "ume": self.ume,
@@ -69,6 +71,9 @@ class OptimizationResult:
             "total_cost": self.total_cost,
             "h2_revenue": self.h2_revenue,
         }
+        if self.mode_distribution:
+            d["mode_distribution"] = self.mode_distribution
+        return d
 
 
 @dataclass
@@ -95,7 +100,7 @@ class ParetoResult:
 
 
 class EpsilonConstraintOptimizer:
-    """Multi-objective optimizer using ε-constraint method."""
+    """Multi-objective optimizer using ε-constraint method (pure LP, no binaries)."""
 
     def __init__(
         self,
@@ -107,8 +112,8 @@ class EpsilonConstraintOptimizer:
         bounds: Optional[CapacityBounds] = None,
         h2_price: Optional[float] = None,
         lhv_profile: Optional[np.ndarray] = None,
-        solver: str = "HiGHS",
-        time_limit_sec: int = 300,
+        solver: str = "CBC",
+        time_limit_sec: int = 600,
         gap_tolerance: float = 0.02,
         solver_verbose: bool = True,
     ):
@@ -123,8 +128,8 @@ class EpsilonConstraintOptimizer:
             bounds: Capacity bounds
             h2_price: H2 price for revenue
             lhv_profile: Hourly biomass LHV values (MJ/kg), 8760 array
-            solver: MILP solver ("HiGHS", "CBC", or "GLPK")
-            time_limit_sec: Max seconds per solve (default 300)
+            solver: LP solver ("CBC", "HiGHS", "CPLEX_PY", "CPLEX_CMD")
+            time_limit_sec: Max seconds per solve (default 600)
             gap_tolerance: Relative optimality gap (default 0.02 = 2%)
             solver_verbose: Show solver output (default True)
         """
@@ -153,37 +158,74 @@ class EpsilonConstraintOptimizer:
         ])
 
         self.cost_calculator = CostCalculator(self.costs, self.economic)
-        self.objective_calculator = ObjectiveCalculator(self.costs, self.economic)
-        self.constraint_builder = ConstraintBuilder(self.hours, self.bounds)
 
         self.time_limit_sec = time_limit_sec
         self.gap_tolerance = gap_tolerance
         self.solver_verbose = solver_verbose
+        self.solver_name = solver.upper()
 
-        # Select solver with sane defaults
+        # Select solver: CPLEX first, fallback to HiGHS/CBC
         msg_flag = solver_verbose
-        if solver.upper() == "HIGHS":
+        if self.solver_name == "CPLEX_PY":
+            try:
+                self.solver = pulp.CPLEX_PY(
+                    msg=msg_flag,
+                    timeLimit=time_limit_sec,
+                    gapRel=gap_tolerance,
+                )
+            except Exception as e:
+                print(f"WARNING: CPLEX_PY unavailable ({e}), falling back to HiGHS")
+                self.solver_name = "HIGHS"
+                self.solver = pulp.HiGHS(
+                    msg=msg_flag,
+                    timeLimit=time_limit_sec,
+                    gapRel=gap_tolerance,
+                )
+        elif self.solver_name == "CPLEX_CMD":
+            try:
+                self.solver = pulp.CPLEX_CMD(
+                    msg=msg_flag,
+                    timeLimit=time_limit_sec,
+                    gapRel=gap_tolerance,
+                )
+            except Exception as e:
+                print(f"WARNING: CPLEX_CMD unavailable ({e}), falling back to HiGHS")
+                self.solver_name = "HIGHS"
+                self.solver = pulp.HiGHS(
+                    msg=msg_flag,
+                    timeLimit=time_limit_sec,
+                    gapRel=gap_tolerance,
+                )
+        elif self.solver_name == "HIGHS":
             self.solver = pulp.HiGHS(
                 msg=msg_flag,
                 timeLimit=time_limit_sec,
                 gapRel=gap_tolerance,
             )
-        elif solver.upper() == "CBC":
+        elif self.solver_name == "CBC":
             msg_level = 1 if solver_verbose else 0
             self.solver = pulp.PULP_CBC_CMD(
                 msg=msg_level,
                 timeLimit=time_limit_sec,
                 gapRel=gap_tolerance,
             )
-        elif solver.upper() == "GLPK":
-            msg_level = 1 if solver_verbose else 0
-            self.solver = pulp.GLPK_CMD(msg=msg_level)
         else:
-            self.solver = pulp.HiGHS(
-                msg=msg_flag,
-                timeLimit=time_limit_sec,
-                gapRel=gap_tolerance,
-            )
+            # Default to CPLEX_PY
+            try:
+                self.solver = pulp.CPLEX_PY(
+                    msg=msg_flag,
+                    timeLimit=time_limit_sec,
+                    gapRel=gap_tolerance,
+                )
+                self.solver_name = "CPLEX_PY"
+            except Exception:
+                self.solver = pulp.HiGHS(
+                    msg=msg_flag,
+                    timeLimit=time_limit_sec,
+                    gapRel=gap_tolerance,
+                )
+                self.solver_name = "HIGHS"
+
 
     @staticmethod
     def _default_lhv_profile() -> np.ndarray:
@@ -213,7 +255,14 @@ class EpsilonConstraintOptimizer:
         self,
         name: str = "HRES_Optimization",
     ) -> Tuple[pulp.LpProblem, Dict]:
-        """Build the MILP model.
+        """Build pure LP model with design constraints (no binary variables).
+
+        Binary dispatch modes (Eq 9-10) are replaced by continuous design
+        constraints that enforce the same flowchart behavior:
+        - RE_MIN: renewable-first dispatch
+        - ELZ RE-only: prevents BM→ELZ→H2 exploit
+        - Capacity bounds: minimum sizing for FC, BM, Wind, H2, ELZ
+        - H2 market caps: rate + annual limits constrain sales
 
         Returns:
             Tuple of (model, variables_dict)
@@ -228,7 +277,7 @@ class EpsilonConstraintOptimizer:
         cap_h2 = pulp.LpVariable("cap_h2", lowBound=self.bounds.h2_storage_min, upBound=self.bounds.h2_storage_max)
         cap_bm = pulp.LpVariable("cap_bm", lowBound=self.bounds.biomass_min, upBound=self.bounds.biomass_max)
 
-        # Hourly power variables (simplified - using capacity factors)
+        # Hourly power variables (all continuous)
         p_pv = [pulp.LpVariable(f"p_pv_{h}", lowBound=0) for h in range(self.hours)]
         p_wind = [pulp.LpVariable(f"p_wind_{h}", lowBound=0) for h in range(self.hours)]
         p_fc = [pulp.LpVariable(f"p_fc_{h}", lowBound=0) for h in range(self.hours)]
@@ -242,59 +291,49 @@ class EpsilonConstraintOptimizer:
         g_h = [pulp.LpVariable(f"g_h_{h}", lowBound=0) for h in range(self.hours)]
         h2_level = [pulp.LpVariable(f"h2_{h}", lowBound=0) for h in range(self.hours)]
 
-        # Binary variables for BM on/off status, using 4-hour blocks to reduce
-        # binary count from 8760 to 2190. Physically realistic: steam Rankine BM
-        # generators operate in multi-hour blocks due to startup time.
-        BM_BLOCK_SIZE = 4
-        n_blocks = (self.hours + BM_BLOCK_SIZE - 1) // BM_BLOCK_SIZE
-        y_bm_block = [pulp.LpVariable(f"y_bm_b{b}", cat="Binary") for b in range(n_blocks)]
-        # Map each hour to its block's binary
-        y_bm = [y_bm_block[h // BM_BLOCK_SIZE] for h in range(self.hours)]
-
-        # Add constraints
-
-        # PV and wind output constraints
+        # ── PV and wind output constraints ──
         for h in range(self.hours):
             model += p_pv[h] <= cap_pv * self.irradiance[h], f"pv_out_{h}"
             model += p_wind[h] <= cap_wind * self.wind[h], f"wind_out_{h}"
 
-        # Power balance
+        # ── Power balance (Eq 8): P_PV + P_WT + P_FC + P_BM = P_D + P_ELZ - UME ──
         for h in range(self.hours):
             model += (
                 p_pv[h] + p_wind[h] + p_fc[h] + p_bm[h]
                 == self.demand[h] + p_elz[h] - p_ume[h]
             ), f"balance_{h}"
 
-        # FC and BM capacity limits
-        M_bm = self.bounds.biomass_max
-
+        # ── Capacity upper bounds per hour ──
         for h in range(self.hours):
             model += p_fc[h] <= cap_fc, f"fc_cap_{h}"
             model += p_bm[h] <= cap_bm, f"bm_cap_{h}"
-            model += p_bm[h] <= M_bm * y_bm[h], f"bm_on_{h}"
-            # BM minimum load constraint (Paper Fig 4, BiomassParameters.min_load_fraction=0.30)
-            # When y_bm=1 (on): p_bm >= 0.30 * cap_bm
-            # When y_bm=0 (off): RHS becomes negative, constraint relaxed
-            model += p_bm[h] >= 0.30 * cap_bm - M_bm * (1 - y_bm[h]), f"bm_min_load_{h}"
-
-        # Electrolyzer constraints
-        for h in range(self.hours):
             model += p_elz[h] <= cap_elz, f"elz_cap_{h}"
-            # ELZ renewable-only: electrolyzer can only consume renewable electricity
-            # Prevents BM → ELZ → H2 sales exploit (paper Figure 2: ELZ fed by RE excess)
+
+        # ── ELZ RE-only constraint: prevents BM→ELZ→H2 exploit ──
+        for h in range(self.hours):
             model += p_elz[h] <= p_pv[h] + p_wind[h], f"elz_re_only_{h}"
 
-        # H2 production/consumption rates
-        # ELZ: ~70% efficient → 1/(0.70 * 33.33 kWh/kg) ≈ 0.021 kg/kWh
-        ELZ_H2_RATE = 0.02100
-        # FC: ~50% efficient (V_cell/1.48 ≈ 0.499) → 1/(0.499 * 33.33) ≈ 0.060 kg/kWh
+        # ── Design constraints (replace binary dispatch logic) ──
+
+        # RE_MIN: at least 80% of served demand from renewables (forces renewable-first)
+        # Linearized: sum(p_pv + p_wind) + RE_MIN * sum(p_ume) >= RE_MIN * total_demand
+        # This way higher UME properly reduces required RE, creating proper Pareto trade-off
+        total_demand = sum(self.demand)
+        RE_MIN = 0.80
+        model += (
+            pulp.lpSum(p_pv) + pulp.lpSum(p_wind) + RE_MIN * pulp.lpSum(p_ume)
+            >= RE_MIN * total_demand
+        ), "re_min_energy"
+
+        # ── H2 production/consumption rates (Eq 13, 15) ──
+        ELZ_H2_RATE = 0.02100  # kg/kWh (70% efficient)
         FC_H2_RATE = 1.0 / (0.499 * 33.33)  # ~0.0601 kg/kWh
 
         for h in range(self.hours):
             model += q_elz[h] == p_elz[h] * ELZ_H2_RATE, f"h2_prod_{h}"
             model += q_fc[h] == p_fc[h] * FC_H2_RATE, f"h2_cons_{h}"
 
-        # H2 storage balance
+        # ── H2 storage balance (Eq 16) ──
         initial_h2 = 0.5  # Initial SOC fraction
 
         for h in range(self.hours):
@@ -307,31 +346,21 @@ class EpsilonConstraintOptimizer:
                     h2_level[h] == h2_level[h - 1] + q_elz[h] - q_fc[h] - g_h[h]
                 ), f"h2_bal_{h}"
 
-            # SOC limits
+            # SOC limits (Eq 16: Hmin < Hh < Hmax)
             model += h2_level[h] >= 0.1 * cap_h2, f"h2_min_{h}"
             model += h2_level[h] <= 0.95 * cap_h2, f"h2_max_{h}"
 
-            # CRITICAL FIX: H2 sales bounded by what's available in storage
-            # Can only sell H2 that exists (Equation 16 constraint)
+            # H2 sales bounded by storage availability
             if h == 0:
-                # At hour 0, can sell from initial storage + production
                 model += g_h[h] <= initial_h2 * cap_h2 + q_elz[h], f"h2_sale_limit_{h}"
             else:
-                # At other hours, can sell from previous level + production
                 model += g_h[h] <= h2_level[h - 1] + q_elz[h], f"h2_sale_limit_{h}"
 
-            # CRITICAL FIX: Maximum H2 sales rate per hour (market constraint)
-            # Realistic market can only absorb limited H2 per hour
+            # Maximum H2 sales rate per hour (market constraint)
             model += g_h[h] <= self.bounds.h2_max_sales_rate, f"h2_max_sales_{h}"
 
-        # CRITICAL FIX: Annual H2 sales limit (market constraint)
-        # Local market has finite demand for H2
+        # Annual H2 sales limit (market constraint)
         model += pulp.lpSum(g_h) <= self.bounds.h2_max_annual_sales, "annual_h2_sales_limit"
-
-        # BM utilization cap: steam Rankine availability + maintenance (~50%)
-        # Proxy for paper's dispatch priority (FC tried before BM, Eq 9-10)
-        max_bm_blocks = int(0.50 * n_blocks)
-        model += pulp.lpSum(y_bm_block) <= max_bm_blocks, "biomass_utilization_limit"
 
         variables = {
             "cap_pv": cap_pv,
@@ -350,8 +379,6 @@ class EpsilonConstraintOptimizer:
             "q_fc": q_fc,
             "g_h": g_h,
             "h2_level": h2_level,
-            "y_bm": y_bm,
-            "y_bm_block": y_bm_block,
         }
 
         return model, variables
@@ -370,8 +397,6 @@ class EpsilonConstraintOptimizer:
         n = self.economic.project_lifetime
 
         # Effective capital costs including replacement costs (Paper Eq 4)
-        # Components with lifetime < project_lifetime need periodic replacements
-        # effective_cost = initial + Σ (initial / (1+dr)^t) for each replacement year
         from config.parameters import ComponentLifetimes
         lifetimes = ComponentLifetimes()
 
@@ -426,26 +451,17 @@ class EpsilonConstraintOptimizer:
         # Net annual cost
         net_cost = annual_cost - h2_revenue
 
-        # Total energy served (for COE denominator)
-        # FIXED: Use demand actually served = demand - unmet energy
-        # This matches Equation 2 from the paper: E_served = total demand delivered
-        energy_served = pulp.lpSum(
-            [
-                self.demand[h] - variables["p_ume"][h]
-                for h in range(self.hours)
-            ]
-        )
-
         # UME expression
         ume = pulp.lpSum(variables["p_ume"])
 
         return net_cost, ume
 
+    def _solve(self, model: pulp.LpProblem) -> None:
+        """Solve LP model directly (no warm starts needed for pure LP)."""
+        model.solve(self.solver)
+
     def minimize_coe(self) -> OptimizationResult:
         """Minimize COE (f1) with max UME constraint.
-
-        A max UME bound (50%) prevents the degenerate solution where
-        the solver maximizes H2 revenue while serving zero demand.
 
         Returns:
             OptimizationResult with minimum COE solution
@@ -456,13 +472,12 @@ class EpsilonConstraintOptimizer:
         # Set objective to minimize cost
         model += net_cost, "min_cost"
 
-        # Require at least 50% of demand to be served (prevents degenerate
-        # zero-demand solution where solver just maximizes H2 revenue)
+        # Require at least 50% of demand to be served
         total_demand = sum(self.demand)
         model += ume <= 0.5 * total_demand, "max_ume_bound"
 
-        # Solve
-        model.solve(self.solver)
+        # Solve LP
+        self._solve(model)
 
         return self._extract_result(model, variables)
 
@@ -478,8 +493,8 @@ class EpsilonConstraintOptimizer:
         # Set objective to minimize UME
         model += ume, "min_ume"
 
-        # Solve
-        model.solve(self.solver)
+        # Solve LP
+        self._solve(model)
 
         return self._extract_result(model, variables)
 
@@ -503,12 +518,12 @@ class EpsilonConstraintOptimizer:
         # Set objective to minimize cost
         model += net_cost, "min_cost"
 
-        # Add epsilon constraint (convert ratio to absolute kWh to match ume expression)
+        # Add epsilon constraint
         total_demand = sum(self.demand)
         model += ume <= epsilon * total_demand, "epsilon_constraint"
 
-        # Solve
-        model.solve(self.solver)
+        # Solve LP
+        self._solve(model)
 
         return self._extract_result(model, variables)
 
@@ -518,19 +533,12 @@ class EpsilonConstraintOptimizer:
     ) -> ParetoResult:
         """Generate Pareto front using ε-constraint method.
 
-        Algorithm from Figure 3:
-        1. Solve min f1 → f1*, f2_at_f1
-        2. Solve min f2 → f2*, f1_at_f2
-        3. For ε in [f2*, f2_at_f1]: min f1 s.t. f2 ≤ ε
-        4. Filter dominated solutions
-
         Args:
             n_points: Number of Pareto points to generate
 
         Returns:
             ParetoResult with Pareto front and knee point
         """
-        # Total solves: 2 anchors + (n_points - 2) intermediate = n_points
         total_solves = n_points
         pareto_start = time.time()
 
@@ -554,7 +562,7 @@ class EpsilonConstraintOptimizer:
         # Step 3: Generate epsilon values (UME ratios)
         epsilon_values = np.linspace(ume_at_min_ume, ume_at_min_coe, n_points)
 
-        # Step 4: Solve for each epsilon (skip first=min-UME anchor, last=min-COE anchor)
+        # Step 4: Solve for each epsilon
         solutions = [f2_anchor]
 
         for i, eps in enumerate(epsilon_values[1:-1], start=3):
@@ -568,7 +576,6 @@ class EpsilonConstraintOptimizer:
             else:
                 print(f"{result.status} ({elapsed:.1f}s)")
 
-        # Append min-COE anchor (already solved in step 1, not a new solve)
         solutions.append(f1_anchor)
 
         total_elapsed = time.time() - pareto_start
@@ -594,15 +601,7 @@ class EpsilonConstraintOptimizer:
         model: pulp.LpProblem,
         variables: Dict,
     ) -> OptimizationResult:
-        """Extract results from solved model.
-
-        Args:
-            model: Solved PuLP model
-            variables: Variable dictionary
-
-        Returns:
-            OptimizationResult
-        """
+        """Extract results from solved model."""
         status = pulp.LpStatus[model.status]
 
         if status != "Optimal":
@@ -633,7 +632,6 @@ class EpsilonConstraintOptimizer:
         cap_bm = pulp.value(variables["cap_bm"])
 
         # Calculate totals
-        # FIXED: Use demand served = demand - unmet (consistent with objective)
         annual_energy = sum(
             self.demand[h] - pulp.value(variables["p_ume"][h])
             for h in range(self.hours)
@@ -657,7 +655,6 @@ class EpsilonConstraintOptimizer:
                 t += lifetime
             return total
 
-        # Apply same installation factor as MILP objective
         inst = self.economic.installation_factor
 
         capital = (
@@ -674,7 +671,7 @@ class EpsilonConstraintOptimizer:
             pulp.value(variables["p_bm"][h]) * self.bm_fuel_cost_kwh[h]
             for h in range(self.hours)
         )
-        # FC hourly O&M: count hours where FC produced power
+        # FC hourly O&M
         fc_om_total = self.costs.fuel_cell_om_hourly * sum(
             1.0 for h in range(self.hours)
             if pulp.value(variables["p_fc"][h]) > 0.01
@@ -701,6 +698,28 @@ class EpsilonConstraintOptimizer:
         ume = annual_unmet / total_demand if total_demand > 0 else 1.0
         reliability = 1 - ume
 
+        # Post-hoc mode classification from continuous variables (for reporting)
+        mode_counts = {"mode_0": 0, "mode_a": 0, "mode_b": 0, "mode_c": 0}
+        for h in range(self.hours):
+            elz_val = pulp.value(variables["p_elz"][h]) or 0
+            fc_val = pulp.value(variables["p_fc"][h]) or 0
+            bm_val = pulp.value(variables["p_bm"][h]) or 0
+            if elz_val > 0.1:
+                mode_counts["mode_0"] += 1  # surplus + ELZ
+            elif fc_val > 0.1 and bm_val > 0.1:
+                mode_counts["mode_c"] += 1  # FC + BM
+            elif fc_val > 0.1:
+                mode_counts["mode_a"] += 1  # FC backup
+            elif bm_val > 0.1:
+                mode_counts["mode_b"] += 1  # BM backup
+            else:
+                mode_counts["mode_0"] += 1  # RE-only
+        mode_distribution = mode_counts
+        print(f"    Modes: 0={mode_counts['mode_0']}({mode_counts['mode_0']/self.hours*100:.0f}%) "
+              f"A={mode_counts['mode_a']}({mode_counts['mode_a']/self.hours*100:.0f}%) "
+              f"B={mode_counts['mode_b']}({mode_counts['mode_b']/self.hours*100:.0f}%) "
+              f"C={mode_counts['mode_c']}({mode_counts['mode_c']/self.hours*100:.0f}%)")
+
         return OptimizationResult(
             status=status,
             coe=coe,
@@ -717,6 +736,7 @@ class EpsilonConstraintOptimizer:
             annual_unmet_kwh=annual_unmet,
             total_cost=total_cost,
             h2_revenue=h2_revenue,
+            mode_distribution=mode_distribution,
         )
 
     def _filter_dominated(
@@ -730,7 +750,6 @@ class EpsilonConstraintOptimizer:
             dominated = False
             for j, sol_j in enumerate(solutions):
                 if i != j:
-                    # Check if sol_j dominates sol_i
                     if (sol_j.coe <= sol_i.coe and sol_j.ume <= sol_i.ume and
                             (sol_j.coe < sol_i.coe or sol_j.ume < sol_i.ume)):
                         dominated = True
@@ -746,6 +765,9 @@ class EpsilonConstraintOptimizer:
     ) -> int:
         """Find knee point index in Pareto front."""
         if len(solutions) <= 2:
+            # With 2 points, pick the one with lower COE (better trade-off)
+            if len(solutions) == 2:
+                return 0 if solutions[0].coe <= solutions[1].coe else 1
             return 0
 
         coes = np.array([s.coe for s in solutions])

@@ -1,23 +1,33 @@
-"""Dispatch scheduler implementing the operational logic.
+"""Dispatch scheduler implementing Figure 4 corrected flowchart.
 
 Reference: Section 2.5.2.1, Equations 8-10, Figure 4
+Based on corrected flowchart (h2_hres_flowchart.html)
 
 Dispatch modes (Eq 9):
-- Mode 0 (ℶ_0): P^HRES = PV + WT (excess to electrolyzer)
-- Mode A (ℶ_a): P^HRES = PV + WT + FC (fuel cell backup)
-- Mode B (ℶ_b): P^HRES = PV + WT + BM (biomass backup)
-- Mode C (ℶ_c): P^HRES = PV + WT + BM + FC (both backups)
+- Mode 0 (ℶ₀): PV + WT ≥ demand → surplus → ELZ active (LEFT side)
+- Mode A (ℶₐ): Deficit → FC backup sufficient (RIGHT side)
+- Mode B (ℶ_b): Deficit → BM backup only, no FC (RIGHT side)
+- Mode C (ℶ_c): Deficit → FC + BM both needed (RIGHT side)
 
-Dispatch logic (Figure 4):
-IF P_PV + P_WT >= P_D:
-    Excess → Electrolyzer → H2 storage/sales
-ELSE (deficit):
-    IF H2_available > H_min:
-        Activate Fuel Cell
-    ELIF Biomass_available:
-        Activate Biomass
-    ELSE:
-        Both FC + Biomass
+Corrected flowchart structure:
+  Decision 1 (S₀): PV + WT ≥ demand?
+  ├─ YES → SURPLUS (S₁, LEFT side)
+  │   ├─ Electrolyzer active (ℶ₀ = 1), consumes surplus only
+  │   ├─ β decision (implicit via tank overflow):
+  │   │   β=1 (dry season): tank full → sell overflow H₂ → revenue
+  │   │   β=0 (wet season): tank has space → save H₂ for FC backup
+  │   └─ Demand fully met by PV+WT → MODE_0
+  └─ NO → DEFICIT (S₂, RIGHT side)
+      ├─ No H₂ sales (all reserved for power)
+      ├─ FC backup if H₂ > H_min → Decision 3b: PV+WT+FC ≥ demand?
+      │   ├─ YES → MODE_A (ℶₐ = 1)
+      │   └─ NO → Add BM (demand-following, not baseload)
+      │       ├─ FC was active → MODE_C (ℶ_c = 1)
+      │       └─ FC was off → MODE_B (ℶ_b = 1)
+      └─ Remaining unmet → UME
+
+Key: β decision only on LEFT/surplus side.
+RIGHT/deficit side has NO H₂ sales — all H₂ reserved for FC power.
 """
 
 from dataclasses import dataclass
@@ -159,23 +169,13 @@ class DispatchScheduler:
         lhv_mj_kg: float,
         feedstock_available: float = float("inf"),
     ) -> HourlyDispatch:
-        """Dispatch power for a single hour.
+        """Dispatch power for a single hour following Figure 4 flowchart.
 
-        Strategy: 
-        1. Biomass runs as Baseload (Max Capacity) to maximize reliable power and H2 production.
-        2. Renewables add to supply.
-        3. If Surplus -> Electrolyzer (H2).
-        4. If Deficit -> Fuel Cell (Backup).
+        Decision 1: PV+WT >= demand?
+          YES (surplus) → ELZ from excess, β implicit via tank overflow
+          NO (deficit)  → FC first, then BM, then UME. No H₂ sales.
         """
-        # 1. Biomass Baseload Dispatch
-        target_bm = self.biomass.capacity
-        bm_output = self.biomass.calculate_output(target_bm, lhv_mj_kg, feedstock_available)
-        p_bm = float(np.atleast_1d(bm_output.power_kw)[0])
-        feedstock_used = float(
-            np.atleast_1d(bm_output.details["feed_rate_kg_h"])[0]
-        )
-
-        # 2. Renewable Generation
+        # Step 1: Calculate renewable generation
         pv_output = self.pv.calculate_output(irradiance, temperature)
         p_pv = float(np.atleast_1d(pv_output.power_kw)[0])
 
@@ -184,55 +184,84 @@ class DispatchScheduler:
 
         renewable_power = p_pv + p_wind
 
-        # available H2
+        # H2 availability for FC
         h2_available = self.h2_storage.available_to_discharge
+        h2_min_threshold = self.h2_storage.capacity * 0.10  # SOC_min
 
-        # 3. Net Load Calculation
-        total_gen = p_bm + renewable_power
-        
+        # Initialize outputs
         p_fc = 0.0
+        p_bm = 0.0
         p_elz = 0.0
         p_ume = 0.0
         h2_produced = 0.0
         h2_consumed = 0.0
         h2_sold = 0.0
-        
-        mode = DispatchMode.MODE_B # Default to Biomass active
+        feedstock_used = 0.0
 
-        if total_gen >= demand:
-            # Surplus case
-            mode = DispatchMode.MODE_0 # Effectively Surplus Mode
-            excess = total_gen - demand
-            
-            if excess > 0:
-                elz_power = min(excess, self.electrolyzer.capacity)
-                # Check min load
+        # ─── Decision 1: Surplus or Deficit? ───
+        if renewable_power >= demand:
+            # ═══ LEFT SIDE (S₁): Surplus — Flowchart Figure 4 ═══
+            mode = DispatchMode.MODE_0
+            surplus = renewable_power - demand
+
+            # Electrolyzer consumes surplus power only (not all RE)
+            if surplus > 0:
+                elz_power = min(surplus, self.electrolyzer.capacity)
+                # Enforce minimum load
                 if elz_power >= self.electrolyzer.capacity * self.electrolyzer.params.min_load_fraction:
                     p_elz = elz_power
                     elz_output = self.electrolyzer.calculate_output(p_elz)
                     h2_produced = float(
                         np.atleast_1d(elz_output.details["h2_production_kg_h"])[0]
                     )
-                    
+
+                    # β decision (implicit via tank overflow):
+                    # Tank has space → store H₂ (β=0, save for FC)
+                    # Tank full → overflow sold to market (β=1, sell H₂)
                     _, storable_amount = self.h2_storage.can_charge(h2_produced)
                     h2_sold = h2_produced - storable_amount
-        
+
         else:
-            # Deficit case - Need Fuel Cell
-            mode = DispatchMode.MODE_C # Biomass + FC (since BM is already running)
-            deficit = demand - total_gen
-            
-            # Use FC
-            target_fc = min(deficit, self.fuel_cell.capacity)
-            fc_output = self.fuel_cell.calculate_output(target_fc, h2_available)
-            p_fc = float(np.atleast_1d(fc_output.power_kw)[0])
-            h2_consumed = float(
-                np.atleast_1d(fc_output.details["h2_consumption_kg_h"])[0]
-            )
-            
-            remaining = deficit - p_fc
-            if remaining > 0:
-                p_ume = remaining
+            # ═══ RIGHT SIDE (S₂): Deficit — Flowchart Figure 4 ═══
+            # No H₂ sales during deficit (flowchart: "No H₂ Sales" box)
+            deficit = demand - renewable_power
+
+            # Step 1: FC is primary backup (try first)
+            if h2_available > h2_min_threshold:
+                target_fc = min(deficit, self.fuel_cell.capacity)
+                fc_output = self.fuel_cell.calculate_output(target_fc, h2_available)
+                p_fc = float(np.atleast_1d(fc_output.power_kw)[0])
+                h2_consumed = float(
+                    np.atleast_1d(fc_output.details["h2_consumption_kg_h"])[0]
+                )
+                deficit -= p_fc
+
+            # Decision 3b: PV+WT+FC >= demand?
+            if deficit <= 0.01:
+                mode = DispatchMode.MODE_A  # FC backup was enough
+            else:
+                # Step 2: BM for remaining deficit (backup, NOT baseload)
+                target_bm = min(deficit, self.biomass.capacity)
+                # Enforce BM minimum load when activated
+                if 0 < target_bm < self.biomass.capacity * self.biomass.params.min_load_fraction:
+                    target_bm = self.biomass.capacity * self.biomass.params.min_load_fraction
+
+                bm_output = self.biomass.calculate_output(
+                    target_bm, lhv_mj_kg, feedstock_available
+                )
+                p_bm = float(np.atleast_1d(bm_output.power_kw)[0])
+                feedstock_used = float(
+                    np.atleast_1d(bm_output.details["feed_rate_kg_h"])[0]
+                )
+                deficit -= p_bm
+
+                if p_fc > 0:
+                    mode = DispatchMode.MODE_C  # FC + BM both active
+                else:
+                    mode = DispatchMode.MODE_B  # BM only (no H₂ for FC)
+
+                if deficit > 0:
+                    p_ume = deficit  # Remaining → UME
 
         # Update H2 storage
         storage_result = self.h2_storage.simulate_hour(

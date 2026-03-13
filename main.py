@@ -135,9 +135,10 @@ def run_all_scenarios(year: int = 2023):
 
 def run_optimization(
     n_pareto_points: int = 10,
-    time_limit: int = 300,
+    time_limit: int = 600,
     gap: float = 0.02,
     solver_verbose: bool = True,
+    solver: str = "CBC",
 ):
     """Run epsilon-constraint multi-objective optimization."""
     print("=" * 60)
@@ -157,8 +158,12 @@ def run_optimization(
     irradiance = met_data["irradiance"].values
     wind_speed = met_data["wind_speed_50m"].values
 
-    # Normalize to 0-1 range
-    irradiance_factor = irradiance / 1000.0  # Normalize by STC
+    # Apply PV derating (Eq 11): df=0.80, temperature correction
+    temperature = met_data["temperature"].values
+    t_cell = temperature + (irradiance / 800) * (45 - 20)  # NOCT=45°C
+    delta_t = t_cell - 25  # STC temperature
+    temp_factor = 1 + (-0.0045) * delta_t  # K_T = -0.0045 /°C
+    irradiance_factor = (irradiance / 1000.0) * 0.80 * temp_factor
     irradiance_factor = np.clip(irradiance_factor, 0, 1)
 
     # Wind factor using simplified power curve
@@ -172,7 +177,7 @@ def run_optimization(
     print(f"Demand profile: {len(demand)} hours")
     print(f"Peak demand: {np.max(demand):.1f} kW")
     print(f"Average demand: {np.mean(demand):.1f} kW")
-    print(f"Solver config: time_limit={time_limit}s, gap={gap*100:.1f}%, verbose={solver_verbose}")
+    print(f"Solver: {solver}, time_limit={time_limit}s, gap={gap*100:.1f}%, verbose={solver_verbose}")
     print()
 
     # Load seasonal LHV profile for biomass fuel cost
@@ -186,6 +191,7 @@ def run_optimization(
         wind_factor=wind_factor,
         h2_price=6.6,
         lhv_profile=lhv_profile,
+        solver=solver,
         time_limit_sec=time_limit,
         gap_tolerance=gap,
         solver_verbose=solver_verbose,
@@ -467,10 +473,17 @@ Examples:
         help="Number of Pareto points (default: 10)",
     )
     parser.add_argument(
+        "--solver",
+        type=str,
+        default="CBC",
+        choices=["CBC", "HiGHS", "CPLEX_PY", "CPLEX_CMD"],
+        help="LP solver (default: CBC)",
+    )
+    parser.add_argument(
         "--time-limit",
         type=int,
-        default=300,
-        help="Max seconds per MILP solve (default: 300)",
+        default=600,
+        help="Max seconds per MILP solve (default: 600)",
     )
     parser.add_argument(
         "--gap",
@@ -500,6 +513,7 @@ Examples:
             time_limit=args.time_limit,
             gap=args.gap,
             solver_verbose=solver_verbose,
+            solver=args.solver,
         )
     elif args.scenarios:
         run_all_scenarios(args.year)

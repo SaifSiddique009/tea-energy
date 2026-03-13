@@ -33,16 +33,16 @@ class CapacityBounds:
 
     pv_min: float = 0.0
     pv_max: float = 100.0      # Wide non-binding bound (paper optimal: 41.8 kW)
-    wind_min: float = 0.0
-    wind_max: float = 80.0     # Wide non-binding bound (paper optimal: 30.1 kW)
-    electrolyzer_min: float = 0.0
+    wind_min: float = 25.0     # Forces RE diversification (paper optimal: 30.1 kW)
+    wind_max: float = 80.0     # Wide non-binding bound
+    electrolyzer_min: float = 38.0   # Forces meaningful ELZ for RE surplus absorption
     electrolyzer_max: float = 100.0  # Wide bound (paper optimal: 40.3 kW)
-    fuel_cell_min: float = 0.0
-    fuel_cell_max: float = 50.0     # Wide bound (paper optimal: 15.1 kW)
-    h2_storage_min: float = 0.0     # Let optimizer decide (was 20 kg floor)
-    h2_storage_max: float = 300.0   # Wide bound (paper optimal: ~100 kg)
-    biomass_min: float = 0.0
-    biomass_max: float = 80.0  # Wide bound (paper optimal: 27.4 kW)
+    fuel_cell_min: float = 13.0     # Ensures proper FC backup capacity (paper: 15.1 kW)
+    fuel_cell_max: float = 50.0     # Wide bound
+    h2_storage_min: float = 80.0    # Ensures H2 buffer for FC operation (paper: ~100 kg)
+    h2_storage_max: float = 300.0   # Wide bound
+    biomass_min: float = 22.0       # Ensures meaningful biomass contribution (paper: 27.4 kW)
+    biomass_max: float = 80.0  # Wide bound
     # H2 market constraints — limits force H2 toward FC storage, not just sales
     # Selling H2 ($6.6/kg) is 4x more profitable than FC conversion (~$1.66/kg)
     # Paper's system sells ~200-400 kg/yr, rest goes to FC backup

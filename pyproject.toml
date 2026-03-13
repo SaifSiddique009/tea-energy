@@ -25,6 +25,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+cplex = ["cplex>=22.1.0"]
 dev = [
     "pytest>=7.3.0",
     "pytest-cov>=4.1.0",
